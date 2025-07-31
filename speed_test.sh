@@ -295,7 +295,7 @@ show_last_results() {
     done
 }
 
-# Функция для создания графиков (только скорость, последние 5 тестов, легенда снизу)
+# Функция для создания графиков (без подписи оси X и без рамки у легенды)
 create_graphs() {
     if ! check_gnuplot; then
         echo -e "${RED}Невозможно создать графики: gnuplot не установлен${NC}"
@@ -330,13 +330,14 @@ create_graphs() {
 set terminal png size 1000,650
 set output '/tmp/speedtest_speed.png'
 set title "Скорость интернета (последние 5 тестов)" font ",14"
-set xlabel "Номер теста" font ",12"
+set xlabel ""  # Пусто — убрали "Номер теста"
 set ylabel "Скорость (Мбит/с)" font ",12"
 set grid x y lt rgb "#cccccc" lw 1
 set xrange [0.8:5.2]
 set yrange [0:500]
 set xtics 1
-set key outside bottom center box horizontal samplen 3 spacing 1.5 width 0 font ",11"
+set key outside bottom center horizontal samplen 3 spacing 1.5 width 0 font ",11"
+set key nobox  # Правильно: убираем рамку вокруг легенды
 plot '/tmp/speedtest_data.tmp' using 1:3 with linespoints title "Скачивание (Download)" lw 2 lc rgb "blue" pt 7 ps 0.8, \
      '/tmp/speedtest_data.tmp' using 1:4 with linespoints title "Отправка (Upload)" lw 2 lc rgb "green" pt 5 ps 0.8
 EOF
