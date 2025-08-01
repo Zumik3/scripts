@@ -1,6 +1,9 @@
 #!/bin/bash
 # speed_test.sh - Тест скорости интернета с графиками и Telegram-уведомлениями
 
+# Фиксируем локаль для корректной работы с числами
+export LC_ALL=C
+
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -17,17 +20,63 @@ LOG_FILE="$SCRIPT_DIR/speedtest.log"
 HISTORY_FILE="$DATA_DIR/history.csv"
 TELEGRAM_CONFIG_FILE="$SCRIPT_DIR/telegram.conf"
 GRAPH_SPEED="/tmp/speedtest_speed.png"
-GRAPH_PING="/tmp/speedtest_ping.png"
-
-# Создаем необходимые директории
-mkdir -p "$DATA_DIR"
 
 # Значения по умолчанию
 MAX_HISTORY_RECORDS=100
 
+# Функция для проверки зависимостей
+check_dependencies() {
+    local missing_deps=()
+    
+    # Проверяем необходимые команды
+    for cmd in awk grep bc curl; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo -e "${RED}Ошибка: отсутствуют необходимые команды:${NC}"
+        printf '%s\n' "${missing_deps[@]}"
+        exit 1
+    fi
+}
+
 # Функция для логирования
 log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    local msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    
+    # Создаем директорию для лога если её нет
+    local log_dir=$(dirname "$LOG_FILE")
+    if [ ! -d "$log_dir" ]; then
+        mkdir -p "$log_dir" 2>/dev/null || return 1
+    fi
+    
+    # Пытаемся записать в лог, игнорируем ошибки
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Функция для валидации server_id
+validate_server_id() {
+    local server_id="$1"
+    
+    if [ -z "$server_id" ]; then
+        return 0  # Пустой server_id допустим
+    fi
+    
+    # Проверяем, что server_id содержит только цифры
+    if ! [[ "$server_id" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Ошибка: server_id должен быть числом${NC}" >&2
+        return 1
+    fi
+    
+    # Проверяем разумные границы
+    if [ "$server_id" -lt 1 ] || [ "$server_id" -gt 999999 ]; then
+        echo -e "${RED}Ошибка: server_id должен быть в диапазоне 1-999999${NC}" >&2
+        return 1
+    fi
+    
+    return 0
 }
 
 # Функция для показа помощи
@@ -40,7 +89,7 @@ show_help() {
   -g, --graph         Показать графики истории
   -l, --list          Показать последние результаты
   -c, --clear         Очистить историю
-  -n, --now           Выполнить тест сейчас
+
   --server ID         Использовать конкретный сервер (ID)
   --stats             Показать статистику по истории
 
@@ -79,6 +128,25 @@ check_gnuplot() {
     return 0
 }
 
+# Создание безопасных временных файлов
+create_temp_files() {
+    local temp_data
+    local plot_script
+    
+    temp_data=$(mktemp "/tmp/speedtest_data.XXXXXXXXXX" 2>/dev/null || echo "/tmp/speedtest_data.tmp")
+    plot_script=$(mktemp "/tmp/speedtest_plot.XXXXXXXXXX" 2>/dev/null || echo "/tmp/speedtest_plot.gp")
+    
+    echo "$temp_data:$plot_script"
+}
+
+# Очистка временных файлов
+cleanup_temp_files() {
+    local temp_data="$1"
+    local plot_script="$2"
+    
+    rm -f "$temp_data" "$plot_script" 2>/dev/null || true
+}
+
 # Загрузка конфига Telegram
 if [ -f "$TELEGRAM_CONFIG_FILE" ]; then
     if [ -r "$TELEGRAM_CONFIG_FILE" ] && [ "$(stat -c %a "$TELEGRAM_CONFIG_FILE" 2>/dev/null)" = "600" ]; then
@@ -97,14 +165,20 @@ run_speedtest() {
     echo -e "${BLUE}Запуск теста скорости интернета...${NC}" >&2
     log_message "Начало теста скорости"
 
-    local cmd="speedtest-cli --csv"
+    # Валидация server_id
+    if ! validate_server_id "$server_id"; then
+        return 1
+    fi
+
+    # Безопасное формирование команды
+    local cmd_args=("speedtest-cli" "--csv")
     if [ -n "$server_id" ]; then
-        cmd="$cmd --server $server_id"
+        cmd_args+=("--server" "$server_id")
     fi
 
     local start_time=$(date +%s)
     local res
-    res=$(eval "$cmd" 2>&1)
+    res=$("${cmd_args[@]}" 2>&1)
     local exit_code=$?
     local end_time=$(date +%s)
     local test_duration=$((end_time - start_time))
@@ -117,15 +191,22 @@ run_speedtest() {
     fi
 
     # Проверка вывода
-    if [ -z "$res" ] || echo "$res" | grep -qi "error\|fail\|not found"; then
-        echo -e "${RED}Ошибка: пустой или некорректный вывод${NC}" >&2
+    if [ -z "$res" ]; then
+        echo -e "${RED}Ошибка: пустой вывод от speedtest-cli${NC}" >&2
+        return 1
+    fi
+    
+    # Проверка на ошибки в выводе
+    if echo "$res" | grep -qi "error\|fail\|not found\|timeout\|connection"; then
+        echo -e "${RED}Ошибка: speedtest-cli сообщил об ошибке${NC}" >&2
+        echo "$res" >&2
         return 1
     fi
 
-    # Парсим поля (ваш формат: server_id, name, city, ts, distance, ping, download, upload, , ip)
+    # Парсим поля (формат: server_id, name, city, ts, distance, ping, download, upload, , ip)
     IFS=',' read -ra fields <<< "$res"
     if [ ${#fields[@]} -lt 8 ]; then
-        echo -e "${RED}Ошибка: слишком мало полей${NC}" >&2
+        echo -e "${RED}Ошибка: слишком мало полей в выводе${NC}" >&2
         echo "Получено: $res" >&2
         return 1
     fi
@@ -153,7 +234,7 @@ run_speedtest() {
     local upload_mbps=$(echo "scale=2; $upload_bps / 1000000" | bc -l 2>/dev/null || echo "0")
 
     # Проверка результата
-    if [ "$download_mbps" = "0" ] && [ $(echo "$download_bps > 10000" | bc -l) -eq 1 ]; then
+    if [ "$download_mbps" = "0" ] && [ $(echo "$download_bps > 10000" | bc -l 2>/dev/null || echo "0") -eq 1 ]; then
         echo -e "${RED}Ошибка: не удалось вычислить download Mbps${NC}" >&2
         return 1
     fi
@@ -161,6 +242,12 @@ run_speedtest() {
     # Форматируем
     download_mbps=$(printf "%.2f" "$download_mbps")
     upload_mbps=$(printf "%.2f" "$upload_mbps")
+
+    # Создаем необходимые директории
+    if ! mkdir -p "$DATA_DIR" 2>/dev/null; then
+        echo -e "${RED}Ошибка: не удалось создать директорию $DATA_DIR${NC}" >&2
+        return 1
+    fi
 
     # Сохраняем
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -181,7 +268,7 @@ run_speedtest() {
 # Ограничение истории
 limit_history_records() {
     if [ -f "$HISTORY_FILE" ]; then
-        local line_count=$(wc -l < "$HISTORY_FILE")
+        local line_count=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0")
         if [ "$line_count" -gt "$MAX_HISTORY_RECORDS" ]; then
             local lines_to_keep=$((MAX_HISTORY_RECORDS + 1))
             tail -n "$lines_to_keep" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
@@ -302,15 +389,18 @@ create_graphs() {
         return 1
     fi
 
-    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE") -lt 2 ]; then
+    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0") -lt 2 ]; then
         echo -e "${YELLOW}Недостаточно данных для создания графиков${NC}"
         return 1
     fi
 
     echo -e "${BLUE}Создание графиков...${NC}"
 
-    local temp_data="/tmp/speedtest_data.tmp"
-    local plot_script="/tmp/speedtest_plot.gp"
+    # Создаем безопасные временные файлы
+    local temp_files
+    temp_files=$(create_temp_files)
+    local temp_data=$(echo "$temp_files" | cut -d':' -f1)
+    local plot_script=$(echo "$temp_files" | cut -d':' -f2)
 
     # Берём последние 5 тестов и нумеруем от 1 до 5
     tail -n +2 "$HISTORY_FILE" | tail -n 5 | \
@@ -322,11 +412,12 @@ create_graphs() {
 
     if [ ! -s "$temp_data" ]; then
         echo -e "${RED}Ошибка: временные данные пусты${NC}"
+        cleanup_temp_files "$temp_data" "$plot_script"
         return 1
     fi
 
     # График скорости
-    cat > "$plot_script" << 'EOF'
+    cat > "$plot_script" << EOF
 set terminal png size 1000,650
 set output '/tmp/speedtest_speed.png'
 set title "Скорость интернета (последние 5 тестов)" font ",14"
@@ -338,19 +429,21 @@ set yrange [0:500]
 set xtics 1
 set key outside bottom center horizontal samplen 3 spacing 1.5 width 0 font ",11"
 set key nobox  # Правильно: убираем рамку вокруг легенды
-plot '/tmp/speedtest_data.tmp' using 1:3 with linespoints title "Скачивание (Download)" lw 2 lc rgb "blue" pt 7 ps 0.8, \
-     '/tmp/speedtest_data.tmp' using 1:4 with linespoints title "Отправка (Upload)" lw 2 lc rgb "green" pt 5 ps 0.8
+plot '$temp_data' using 1:3 with linespoints title "Скачивание (Download)" lw 2 lc rgb "blue" pt 7 ps 0.8, \
+     '$temp_data' using 1:4 with linespoints title "Отправка (Upload)" lw 2 lc rgb "green" pt 5 ps 0.8
 EOF
 
     if ! gnuplot "$plot_script" 2>/tmp/gnuplot_error.log; then
         echo -e "${RED}Ошибка gnuplot (график скорости)${NC}"
         cat /tmp/gnuplot_error.log >&2
+        cleanup_temp_files "$temp_data" "$plot_script"
         return 1
     fi
 
     # Проверка результата
     if [ ! -s "/tmp/speedtest_speed.png" ]; then
         echo -e "${RED}Ошибка: график скорости пуст или не создан${NC}"
+        cleanup_temp_files "$temp_data" "$plot_script"
         return 1
     fi
 
@@ -365,7 +458,14 @@ EOF
         fi
     fi
 
-    rm -f "$temp_data" "$plot_script"
+    cleanup_temp_files "$temp_data" "$plot_script"
+}
+
+# Экранирование текста для Telegram
+escape_telegram_text() {
+    local text="$1"
+    # Экранируем специальные символы Markdown
+    echo "$text" | sed 's/[][\\`*_{}|#+~]/\\&/g'
 }
 
 # Отправка в Telegram
@@ -379,15 +479,21 @@ send_to_telegram() {
     local upload="$3"
     local duration="$4"
 
+    # Экранируем значения для безопасной отправки
+    local safe_ping=$(escape_telegram_text "$ping")
+    local safe_download=$(escape_telegram_text "$download")
+    local safe_upload=$(escape_telegram_text "$upload")
+    local safe_duration=$(escape_telegram_text "$duration")
+
     local message="
 📶 *Результаты теста скорости*
 
 *Время:* $(date '+%Y-%m-%d %H:%M:%S')
-*Длительность:* ${duration} сек
+*Длительность:* ${safe_duration} сек
 
-*Пинг:* ${ping} ms
-*Скачивание:* ${download} Mbps
-*Отправка:* ${upload} Mbps
+*Пинг:* ${safe_ping} ms
+*Скачивание:* ${safe_download} Mbps
+*Отправка:* ${safe_upload} Mbps
 
 #speedtest
 "
@@ -435,7 +541,7 @@ clear_history() {
 
 # Статистика
 show_statistics() {
-    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE") -lt 2 ]; then
+    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0") -lt 2 ]; then
         echo -e "${YELLOW}Недостаточно данных${NC}"
         return
     fi
@@ -469,9 +575,21 @@ show_statistics() {
     }'
 }
 
+# Обработчик сигналов для корректного завершения
+cleanup() {
+    echo -e "\n${YELLOW}Завершение теста скорости...${NC}"
+    exit 0
+}
+
+# Устанавливаем обработчики сигналов
+trap cleanup SIGINT SIGTERM
+
 # Основная функция
 main() {
-    local server_id="" simple_output=false show_graphs=false show_list=false clear_hist=false show_stats=false
+    # Проверяем зависимости
+    check_dependencies
+    
+    local server_id="" simple_output=false show_list=false clear_hist=false show_stats=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -490,8 +608,14 @@ main() {
                 ;;
             -l|--list) show_list=true ;;
             -c|--clear) clear_hist=true ;;
-            -n|--now) : ;;
-            --server) server_id="$2"; shift ;;
+
+            --server) 
+                server_id="$2"
+                if ! validate_server_id "$server_id"; then
+                    exit 1
+                fi
+                shift 
+                ;;
             --stats) show_stats=true ;;
             *) echo -e "${RED}Неизвестный параметр: $1${NC}"; show_help; exit 1 ;;
         esac
