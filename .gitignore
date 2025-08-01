@@ -1,1 +1,4 @@
 .vscode/launch.json
+~/.config/fastfetch/config_with_gpu.jsonc
+~/.config/fastfetch/test_gpu.jsonc
+~/.config/bashrc/30-autostart

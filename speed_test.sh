@@ -89,14 +89,15 @@ show_help() {
   -g, --graph         Показать графики истории
   -l, --list          Показать последние результаты
   -c, --clear         Очистить историю
-
   --server ID         Использовать конкретный сервер (ID)
   --stats             Показать статистику по истории
+  -t, --telegram      Отправить результат в Telegram
 
 Примеры:
   $0                  Выполнить тест и показать результаты
   $0 -g               Показать графики истории
   $0 --server 1234    Использовать сервер с ID 1234
+  $0 --telegram       Выполнить тест и отправить результат в Telegram
 EOF
 }
 
@@ -589,7 +590,7 @@ main() {
     # Проверяем зависимости
     check_dependencies
     
-    local server_id="" simple_output=false show_list=false clear_hist=false show_stats=false
+    local server_id="" simple_output=false show_list=false clear_hist=false show_stats=false send_telegram=false
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -608,7 +609,7 @@ main() {
                 ;;
             -l|--list) show_list=true ;;
             -c|--clear) clear_hist=true ;;
-
+            -t|--telegram) send_telegram=true ;;
             --server) 
                 server_id="$2"
                 if ! validate_server_id "$server_id"; then
@@ -634,7 +635,9 @@ main() {
     if [ $? -eq 0 ]; then
         IFS=',' read -r ping download upload duration <<< "$res"
         show_results "$ping" "$download" "$upload" "$duration" "$simple_output"
-        send_to_telegram "$ping" "$download" "$upload" "$duration"
+        if [ "$send_telegram" = true ]; then
+            send_to_telegram "$ping" "$download" "$upload" "$duration"
+        fi
         [ "$simple_output" = false ] && show_last_results 5 true
     else
         echo -e "${RED}Тест завершился с ошибкой${NC}"
