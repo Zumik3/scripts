@@ -44,10 +44,12 @@ check_dependencies() {
 
 # Функция для логирования
 log_message() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
     
     # Создаем директорию для лога если её нет
-    local log_dir=$(dirname "$LOG_FILE")
+    local log_dir
+    log_dir=$(dirname "$LOG_FILE")
     if [ ! -d "$log_dir" ]; then
         mkdir -p "$log_dir" 2>/dev/null || return 1
     fi
@@ -177,12 +179,16 @@ run_speedtest() {
         cmd_args+=("--server" "$server_id")
     fi
 
-    local start_time=$(date +%s)
+    local start_time
     local res
+    local exit_code
+    local end_time
+    local test_duration
+    start_time=$(date +%s)
     res=$("${cmd_args[@]}" 2>&1)
-    local exit_code=$?
-    local end_time=$(date +%s)
-    local test_duration=$((end_time - start_time))
+    exit_code=$?
+    end_time=$(date +%s)
+    test_duration=$((end_time - start_time))
 
     if [ $exit_code -ne 0 ]; then
         echo -e "${RED}Ошибка выполнения speedtest-cli:${NC}" >&2
@@ -231,11 +237,13 @@ run_speedtest() {
         return 1
     fi
 
-    local download_mbps=$(echo "scale=2; $download_bps / 1000000" | bc -l 2>/dev/null || echo "0")
-    local upload_mbps=$(echo "scale=2; $upload_bps / 1000000" | bc -l 2>/dev/null || echo "0")
+    local download_mbps
+    local upload_mbps
+    download_mbps=$(echo "scale=2; $download_bps / 1000000" | bc -l 2>/dev/null || echo "0")
+    upload_mbps=$(echo "scale=2; $upload_bps / 1000000" | bc -l 2>/dev/null || echo "0")
 
     # Проверка результата
-    if [ "$download_mbps" = "0" ] && [ $(echo "$download_bps > 10000" | bc -l 2>/dev/null || echo "0") -eq 1 ]; then
+    if [ "$download_mbps" = "0" ] && [ "$(echo "$download_bps > 10000" | bc -l 2>/dev/null || echo "0")" -eq 1 ]; then
         echo -e "${RED}Ошибка: не удалось вычислить download Mbps${NC}" >&2
         return 1
     fi
@@ -251,9 +259,12 @@ run_speedtest() {
     fi
 
     # Сохраняем
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local date_iso=$(date '+%Y-%m-%d')
-    local time_iso=$(date '+%H:%M')
+    local timestamp
+    local date_iso
+    local time_iso
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    date_iso=$(date '+%Y-%m-%d')
+    time_iso=$(date '+%H:%M')
 
     if [ ! -f "$HISTORY_FILE" ]; then
         echo "timestamp,date,time,ping,download,upload,duration" > "$HISTORY_FILE"
@@ -269,9 +280,11 @@ run_speedtest() {
 # Ограничение истории
 limit_history_records() {
     if [ -f "$HISTORY_FILE" ]; then
-        local line_count=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0")
+        local line_count
+        line_count="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0")"
         if [ "$line_count" -gt "$MAX_HISTORY_RECORDS" ]; then
-            local lines_to_keep=$((MAX_HISTORY_RECORDS + 1))
+            local lines_to_keep
+        lines_to_keep=$((MAX_HISTORY_RECORDS + 1))
             tail -n "$lines_to_keep" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
         fi
     fi
@@ -344,10 +357,12 @@ draw_bar() {
         value=0
     fi
 
-    local filled_length=$(echo "scale=0; ($value / $max_value) * $bar_length" | bc -l 2>/dev/null || echo "0")
+    local filled_length
+    local empty_length
+    filled_length=$(echo "scale=0; ($value / $max_value) * $bar_length" | bc -l 2>/dev/null || echo "0")
     filled_length=$(echo "$filled_length" | cut -d'.' -f1)
     filled_length=$((filled_length > bar_length ? bar_length : filled_length))
-    local empty_length=$((bar_length - filled_length))
+    empty_length=$((bar_length - filled_length))
 
     printf "%b" "$color_start"
     for ((i=0; i<filled_length; i++)); do
@@ -357,7 +372,7 @@ draw_bar() {
     for ((i=0; i<empty_length; i++)); do
         printf "░"
     done
-    printf " ${value} Mbps\n"
+    printf " %s Mbps\n" "$value"
 }
 
 # Показ последних результатов
@@ -390,7 +405,7 @@ create_graphs() {
         return 1
     fi
 
-    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0") -lt 2 ]; then
+    if [ ! -f "$HISTORY_FILE" ] || [ "$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0")" -lt 2 ]; then
         echo -e "${YELLOW}Недостаточно данных для создания графиков${NC}"
         return 1
     fi
@@ -399,9 +414,11 @@ create_graphs() {
 
     # Создаем безопасные временные файлы
     local temp_files
+    local temp_data
+    local plot_script
     temp_files=$(create_temp_files)
-    local temp_data=$(echo "$temp_files" | cut -d':' -f1)
-    local plot_script=$(echo "$temp_files" | cut -d':' -f2)
+    temp_data=$(echo "$temp_files" | cut -d':' -f1)
+    plot_script=$(echo "$temp_files" | cut -d':' -f2)
 
     # Берём последние 5 тестов и нумеруем от 1 до 5
     tail -n +2 "$HISTORY_FILE" | tail -n 5 | \
@@ -466,7 +483,7 @@ EOF
 escape_telegram_text() {
     local text="$1"
     # Экранируем специальные символы Markdown
-    echo "$text" | sed 's/[][\\`*_{}|#+~]/\\&/g'
+    echo "${text//[][\\\`*_{}|#+~]/\\&}"
 }
 
 # Отправка в Telegram
@@ -481,12 +498,17 @@ send_to_telegram() {
     local duration="$4"
 
     # Экранируем значения для безопасной отправки
-    local safe_ping=$(escape_telegram_text "$ping")
-    local safe_download=$(escape_telegram_text "$download")
-    local safe_upload=$(escape_telegram_text "$upload")
-    local safe_duration=$(escape_telegram_text "$duration")
+    local safe_ping
+    local safe_download
+    local safe_upload
+    local safe_duration
+    safe_ping=$(escape_telegram_text "$ping")
+    safe_download=$(escape_telegram_text "$download")
+    safe_upload=$(escape_telegram_text "$upload")
+    safe_duration=$(escape_telegram_text "$duration")
 
-    local message="
+    local message
+    message="
 📶 *Результаты теста скорости*
 
 *Время:* $(date '+%Y-%m-%d %H:%M:%S')
@@ -542,7 +564,7 @@ clear_history() {
 
 # Статистика
 show_statistics() {
-    if [ ! -f "$HISTORY_FILE" ] || [ $(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0") -lt 2 ]; then
+    if [ ! -f "$HISTORY_FILE" ] || [ "$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo "0")" -lt 2 ]; then
         echo -e "${YELLOW}Недостаточно данных${NC}"
         return
     fi
@@ -631,8 +653,7 @@ main() {
     if [ "$show_stats" = true ]; then show_statistics; exit 0; fi
 
     local res
-    res=$(run_speedtest "$server_id")
-    if [ $? -eq 0 ]; then
+    if res=$(run_speedtest "$server_id"); then
         IFS=',' read -r ping download upload duration <<< "$res"
         show_results "$ping" "$download" "$upload" "$duration" "$simple_output"
         if [ "$send_telegram" = true ]; then
