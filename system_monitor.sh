@@ -18,36 +18,104 @@ CPU_THRESHOLD=80
 RAM_THRESHOLD=85
 DISK_THRESHOLD=90
 
-# Файл лога
-LOG_FILE="/var/log/system_monitor.log"
+# Файл лога (используем домашнюю директорию пользователя)
+LOG_FILE="$HOME/.system_monitor.log"
 
-# Функция для логирования (без падения при отсутствии прав)
+# Функция для проверки зависимостей
+check_dependencies() {
+    local missing_deps=()
+    
+    # Проверяем необходимые команды
+    for cmd in awk grep ps free df; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo -e "${RED}Ошибка: отсутствуют необходимые команды:${NC}"
+        printf '%s\n' "${missing_deps[@]}"
+        exit 1
+    fi
+}
+
+# Функция для логирования (безопасная версия)
 log_message() {
     local msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
     echo "$msg"
+    
+    # Создаем директорию для лога если её нет
+    local log_dir=$(dirname "$LOG_FILE")
+    if [ ! -d "$log_dir" ]; then
+        mkdir -p "$log_dir" 2>/dev/null || return 1
+    fi
+    
     # Пытаемся записать в лог, игнорируем ошибки
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# Функция для получения использования CPU (стабильный способ)
+# Функция для получения использования CPU (улучшенная версия)
 get_cpu_usage() {
-    local cpu_idle=$(vmstat 1 2 | awk 'END {print $15}')
-    echo $((100 - cpu_idle))
+    # Используем /proc/stat для более точного измерения
+    local cpu_line
+    cpu_line=$(grep '^cpu ' /proc/stat)
+    
+    if [ -z "$cpu_line" ]; then
+        echo "0"
+        return 1
+    fi
+    
+    # Парсим значения из /proc/stat
+    local user nice system idle iowait irq softirq steal guest guest_nice
+    read user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
+    
+    # Вычисляем общее время и время простоя
+    local total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    local idle_total=$((idle + iowait))
+    
+    # Вычисляем процент использования
+    local usage=$((100 - (idle_total * 100 / total)))
+    
+    echo "$usage"
 }
 
 # Функция для получения использования RAM
 get_ram_usage() {
-    free | awk '/^Mem:/ {printf "%.0f", ($3 / $2) * 100}'
+    local ram_usage
+    ram_usage=$(free | awk '/^Mem:/ {printf "%.0f", ($3 / $2) * 100}' 2>/dev/null)
+    
+    if [ -z "$ram_usage" ] || ! [[ "$ram_usage" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return 1
+    fi
+    
+    echo "$ram_usage"
 }
 
 # Функция для получения использования диска
 get_disk_usage() {
-    df / | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+    local disk_usage
+    disk_usage=$(df / | awk 'NR==2 {gsub(/%/,"",$5); print $5}' 2>/dev/null)
+    
+    if [ -z "$disk_usage" ] || ! [[ "$disk_usage" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return 1
+    fi
+    
+    echo "$disk_usage"
 }
 
 # Функция для получения использования Swap
 get_swap_usage() {
-    free | awk '/^Swap:/ {if ($2 == 0) print 0; else printf "%.0f", ($3 / $2) * 100}'
+    local swap_usage
+    swap_usage=$(free | awk '/^Swap:/ {if ($2 == 0) print 0; else printf "%.0f", ($3 / $2) * 100}' 2>/dev/null)
+    
+    if [ -z "$swap_usage" ] || ! [[ "$swap_usage" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return 1
+    fi
+    
+    echo "$swap_usage"
 }
 
 # Функция для получения температуры CPU
@@ -56,11 +124,14 @@ get_cpu_temp() {
 
     # Raspberry Pi / многих embedded
     if [ -f "/sys/class/thermal/thermal_zone0/temp" ]; then
-        temp=$(cat /sys/class/thermal/thermal_zone0/temp)
-        temp_c=$((temp / 1000))
+        local temp
+        temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+        if [ -n "$temp" ] && [[ "$temp" =~ ^[0-9]+$ ]]; then
+            temp_c=$((temp / 1000))
+        fi
     # Десктопы/ноутбуки с lm-sensors
     elif command -v sensors &> /dev/null; then
-        temp_c=$(sensors | awk '
+        temp_c=$(sensors 2>/dev/null | awk '
             /^Core/ || /CPU Temp/ || /Package/ {
                 gsub(/\\+|°C|\\(|\\)/, "", $2);
                 if ($2+0 > 0) { print $2+0; exit }
@@ -111,9 +182,15 @@ send_notification() {
 
 # Функция для проверки порогов
 check_thresholds() {
-    local cpu=$1
-    local ram=$2
-    local disk=$3
+    local cpu="$1"
+    local ram="$2"
+    local disk="$3"
+    
+    # Проверяем, что значения являются числами
+    if ! [[ "$cpu" =~ ^[0-9]+$ ]] || ! [[ "$ram" =~ ^[0-9]+$ ]] || ! [[ "$disk" =~ ^[0-9]+$ ]]; then
+        log_message "Ошибка: некорректные значения для проверки порогов"
+        return 1
+    fi
     
     if [ "$cpu" -gt "$CPU_THRESHOLD" ]; then
         send_notification "Высокая нагрузка CPU" "Использование CPU: ${cpu}%" "critical"
@@ -147,15 +224,15 @@ show_top_processes() {
     echo
 
     # Шапка таблицы
-    printf "${BLUE}%-10s %-8s %-8s %-10s %-12s %s${NC}\n" \
+    printf "${BLUE}%-10s %-8s %-8s %-10s %-12s %-50s${NC}\n" \
         "USER" "PID" "$sort_key" "VSZ (MB)" "RSS (MB)" "COMMAND"
 
     # Разделитель
-    printf "${BLUE}%-10s %-8s %-8s %-10s %-12s %s${NC}\n" \
-        "----------" "--------" "--------" "----------" "------------" "----------------------------------------"
+    printf "${BLUE}%-10s %-8s %-8s %-10s %-12s %-50s${NC}\n" \
+        "----------" "--------" "--------" "----------" "------------" "--------------------------------------------------"
 
     # Данные через awk
-    ps aux --sort=-"$sort_key" | awk -v field="$field" '
+    ps aux --sort=-"$sort_key" 2>/dev/null | awk -v field="$field" '
     NR == 1 { next }           # Пропускаем заголовок ps
     NR > 6  { exit }           # Только первые 5 процессов
 
@@ -174,6 +251,11 @@ show_top_processes() {
         }
         gsub(/^ +/, "", cmd)
         if (cmd == "") cmd = "<none>"
+        
+        # Ограничиваем длину команды до 50 символов
+        if (length(cmd) > 50) {
+            cmd = substr(cmd, 1, 47) "..."
+        }
 
         # Определяем цвет в зависимости от типа сортировки и значения
         if (field == 3 && $3 > 50) {
@@ -190,7 +272,7 @@ show_top_processes() {
         reset = "\033[0m"
 
         # Форматированный вывод
-        printf "%-10s %-8s %s%-8s%s %-10d %-12d %s\n",
+        printf "%-10s %-8s %s%-8s%s %-10d %-12d %-50s\n",
             user, pid, color, sprintf("%.1f", $field), reset, vsz, rss, cmd
     }'
 
@@ -199,11 +281,11 @@ show_top_processes() {
 
 # Функция для вывода всей системной информации
 show_system_info() {
-    local cpu=$1
-    local ram=$2
-    local disk=$3
-    local temp=$4
-    local swap=$5
+    local cpu="$1"
+    local ram="$2"
+    local disk="$3"
+    local temp="$4"
+    local swap="$5"
 
     echo -e "${BLUE}================================${NC}"
     echo -e "${BLUE}    СИСТЕМНЫЙ МОНИТОРИНГ${NC}"
@@ -211,7 +293,7 @@ show_system_info() {
     echo
 
     # Общая информация
-    echo -e "${GREEN}Система:${NC} $(hostnamectl)"
+    echo -e "${GREEN}Система:${NC} $(hostnamectl 2>/dev/null || echo 'N/A')"
     echo -e "${GREEN}Время:${NC} $(date)"
     echo -e "${GREEN}Uptime:${NC} $(uptime -p 2>/dev/null || echo 'N/A')"
     echo
@@ -257,21 +339,28 @@ show_system_info() {
     show_top_processes "%mem" "RAM"
 }
 
+# Обработчик сигналов для корректного завершения
+cleanup() {
+    echo -e "\n${YELLOW}Завершение мониторинга...${NC}"
+    exit 0
+}
+
+# Устанавливаем обработчики сигналов
+trap cleanup SIGINT SIGTERM
+
 # Основная функция
 main() {
-    # Создаём директорию и файл лога с правами текущего пользователя
-    sudo mkdir -p "$(dirname "$LOG_FILE")"
-    if [ ! -f "$LOG_FILE" ]; then
-        sudo touch "$LOG_FILE"
-        sudo chown "$USER":"$USER" "$LOG_FILE"
-    fi
+    # Проверяем зависимости
+    check_dependencies
 
-    # Получаем данные
-    cpu_usage=$(get_cpu_usage)
-    ram_usage=$(get_ram_usage)
-    disk_usage=$(get_disk_usage)
+    # Получаем данные с проверкой ошибок
+    local cpu_usage ram_usage disk_usage swap_usage cpu_temp
+    
+    cpu_usage=$(get_cpu_usage) || cpu_usage=0
+    ram_usage=$(get_ram_usage) || ram_usage=0
+    disk_usage=$(get_disk_usage) || disk_usage=0
+    swap_usage=$(get_swap_usage) || swap_usage=0
     cpu_temp=$(get_cpu_temp)
-    swap_usage=$(get_swap_usage)
 
     # Проверяем пороги
     check_thresholds "$cpu_usage" "$ram_usage" "$disk_usage"
@@ -286,22 +375,29 @@ main() {
     echo -e "${BLUE}================================${NC}"
 
     # Количество процессов
-    process_count=$(ps aux | wc -l)
-    echo -e "${GREEN}Активных процессов:${NC} $((process_count - 1))"
+    local process_count
+    process_count=$(ps aux 2>/dev/null | wc -l)
+    if [ -n "$process_count" ] && [[ "$process_count" =~ ^[0-9]+$ ]]; then
+        echo -e "${GREEN}Активных процессов:${NC} $((process_count - 1))"
+    else
+        echo -e "${GREEN}Активных процессов:${NC} N/A"
+    fi
 
     # Сетевая статистика (если vnstat установлен)
     if command -v vnstat &> /dev/null; then
-        iface=$(ip route | grep default | awk '{print $5}' | head -1)
+        local iface
+        iface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
         if [ -n "$iface" ]; then
             echo -e "${GREEN}Трафик ($iface):${NC}"
-            vnstat -i "$iface" --oneline | cut -d';' -f4,5 | \
-                awk -F';' '{print "  Вход: " $1 "   Выход: " $2}'
+            vnstat -i "$iface" --oneline 2>/dev/null | cut -d';' -f4,5 | \
+                awk -F';' '{print "  Вход: " $1 "   Выход: " $2}' || echo "  N/A"
         fi
     fi
 
-    # Проверка логов на критические ошибки
-    if [ -f "/var/log/syslog" ]; then
-        critical_errors=$(tail -30 /var/log/syslog | grep -iE "error|critical|fail|warn" | grep -c .)
+    # Проверка логов на критические ошибки (только если есть права)
+    if [ -r "/var/log/syslog" ]; then
+        local critical_errors
+        critical_errors=$(tail -30 /var/log/syslog 2>/dev/null | grep -iE "error|critical|fail|warn" | grep -c .)
         if [ "$critical_errors" -gt 0 ]; then
             echo -e "${RED}Ошибок в /var/log/syslog:${NC} $critical_errors (см. последние 30 строк)"
         fi
@@ -311,6 +407,13 @@ main() {
 # Непрерывный мониторинг
 continuous_monitor() {
     local interval=${1:-60}
+    
+    # Проверяем корректность интервала
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
+        echo -e "${RED}Ошибка: некорректный интервал: $interval${NC}"
+        exit 1
+    fi
+    
     echo "Непрерывный мониторинг каждые $interval секунд. Нажмите Ctrl+C для остановки."
     while true; do
         clear
@@ -326,9 +429,10 @@ case "${1:-}" in
         ;;
     "--log"|"--l")
         # Только логирование и проверка порогов
-        cpu_usage=$(get_cpu_usage)
-        ram_usage=$(get_ram_usage)
-        disk_usage=$(get_disk_usage)
+        check_dependencies
+        cpu_usage=$(get_cpu_usage) || cpu_usage=0
+        ram_usage=$(get_ram_usage) || ram_usage=0
+        disk_usage=$(get_disk_usage) || disk_usage=0
         check_thresholds "$cpu_usage" "$ram_usage" "$disk_usage"
         ;;
     "--help"|"-h")
@@ -343,6 +447,8 @@ case "${1:-}" in
         echo "  CPU:  $CPU_THRESHOLD%"
         echo "  RAM:  $RAM_THRESHOLD%"
         echo "  Диск: $DISK_THRESHOLD%"
+        echo
+        echo "Лог файл: $LOG_FILE"
         ;;
     *)
         main
